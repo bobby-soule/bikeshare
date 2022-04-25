@@ -1,0 +1,706 @@
+---
+title: 'Capital Bikeshare Analysis'
+author: "Bobby Soule"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+```{r}
+# load packages
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(gridExtra)
+library(ggmap)
+library(forecast)
+library(lubridate)
+library(zoo)
+library(urca)
+library(tseries)
+```
+
+```{r}
+# load trip data
+trip.dat <- readRDS("Trip_Data/all_capitalbikeshare_tripdata.rds")
+
+# load weather data
+temp.dat <-fread("WeatherData.csv") %>%
+  mutate(Date = as.POSIXct(Date, format = "%m/%d/%y"))
+
+# get hourly demand of rentals
+hour.dat <- trip.dat %>%
+  mutate(Year = year(Start.Date), Month = month(Start.Date),
+         Day = day(Start.Date), Hour = hour(Start.Date)) %>% 
+  group_by(Member.Type, Year, Month, Day, Hour) %>% 
+  summarise(count = n()) %>% ungroup %>% 
+  spread(Member.Type, count) %>% 
+  mutate(Casual = ifelse(is.na(Casual), 0, Casual),
+         Member = ifelse(is.na(Member), 0, Member),
+         Unknown = ifelse(is.na(Unknown), 0, Unknown),
+         Count = Casual + Member,
+         datetime = paste(Year, Month, Day, Hour, sep = " ") %>% as.POSIXct(format = "%Y %m %d %H")) %>% 
+  select(Date = datetime, Casual, Member, Count)
+
+# get daily demand of rentals
+day.dat <- trip.dat %>%
+  mutate(Year = year(Start.Date), Month = month(Start.Date), Day = day(Start.Date)) %>% 
+  group_by(Member.Type, Year, Month, Day) %>% 
+  summarise(count = n()) %>% ungroup %>% 
+  spread(Member.Type, count) %>% 
+  mutate(Casual = ifelse(is.na(Casual), 0, Casual),
+         Member = ifelse(is.na(Member), 0, Member),
+         Unknown = ifelse(is.na(Unknown), 0, Unknown),
+         Count = Casual + Member,
+         datetime = paste(Year, Month, Day, sep = " ") %>% as.POSIXct(format = "%Y %m %d")) %>% 
+  select(Date = datetime, Casual, Member, Count)
+# merge on missing dates
+day.dat <- merge(x = day.dat, y = data.frame(Date = seq.POSIXt(as.POSIXct("2010-09-20"), as.POSIXct("2018-12-31"), "days")), all = TRUE)
+
+# get monthly demand of rentals
+month.dat <- trip.dat %>%
+  mutate(Year = year(Start.Date), Month = month(Start.Date)) %>% 
+  group_by(Member.Type, Year, Month) %>% 
+  summarise(count = n()) %>% ungroup %>% 
+  spread(Member.Type, count) %>% 
+  mutate(Count = Casual + Member,
+         Casual.K = Casual / 1000,
+         Member.K = Member / 1000,
+         Count.K = Casual.K + Member.K,
+         datetime = paste(Year, Month, "1", sep = " ") %>% as.POSIXct(format = "%Y %m %d")) %>% 
+  filter(!(Year == 2018 & Month == 12)) %>% 
+  select(Date = datetime, Casual, Member, Count, Casual.K, Member.K, Count.K)
+```
+
+## Introduction
+
+I have obtained publicly available data from Capital Bikeshare. Using this data, I have created basic metrics and visualizations and time series forecasting models. I explore the data with graphical techniques to find trends and patterns in the data, then I use this knowledge to build forecasting models to predict daily and monthly demand in the future. I will also identify popular locations and routes, and I will analyze how Capital Bikeshare has managed its fleet and bike stations over time.  
+
+## The Data
+
+The data I used for this project are publicly available on Capital Bikeshare's website (https://www.capitalbikeshare.com/system-data). That data ranges from when the bikeshare launched in late 2010 up until the end of 2018. There is an observation for each ride taken during this time period. Each observation has information about start and end time, start and end location, duration, bike number, and member type. The dataset is quite large with more than 22 million observations. Let's take a quick look at the first few observations in the dataset.   
+
+```{r}
+knitr::kable(head(trip.dat %>% select(-Start.Number, -End.Number), n = 5))
+```
+
+We now have an idea of what kind of data we have. Later in this report, we will do some exploratory data analysis for the other variables, but for now we will focus on the date variables. 
+
+## Forecasting
+
+We can use the date variables to obtain hourly, daily, and monthly time series of demand. We will then use forecasting models to predict demand in the future. Forecasting the monthly demand can tell us how much we expect the business to grow and can help guide long-term strategy decisions (i.e. growing the fleet, adding new stations, or expanding to new areas). Hourly and daily forecasts give us a look at the short term and can inform us how to efficiently deploy assets throughout the day and week. We will start by looking at monthly demand.
+
+### Monthly Demand
+
+To obtain a dataset of monthly demand we will have to group the dataset by year and month and then count the number of trips in each group. Once we obtain this monthly dataset, we can view a line graph of the demand over time.  
+
+```{r}
+# turn dataset into ts object
+month.ts <- ts(month.dat$Count.K, start = c(2010, 9), frequency = 12)
+
+# time series plot of monthly demand
+autoplot(month.ts, ylab = "Count") +
+  ggtitle("Monthly Bike Share Trips") +
+  xlab("Year") + ylab("Count (Thousands)") +
+  scale_x_continuous(breaks = seq(2011, 2019))
+```
+
+There are a few features of this time series that I would like to point out. We can see an upward trend in the time series. At the beginning, there was rapid growth that has given way to slower, steady growth. We can also see that there is significant annual seasonality with peaks during the summer and troughs during the winter. Furthermore, the variability of the seasonal trend has increased as the overall demand has increased.  
+
+This graph does not tell us the full story. As I mentioned earlier, one of the variables in the original dataset is member type. This variable can take on two values: member and casual. Members are the customers with the annual or 30-day membership; casual users are the customers with the 3-day pass, 24-hour pass, or those making a single trip. Below I have made a plot of the time series separated by user type.  
+
+```{r}
+# turn dataset into multivariate ts object
+month.ts2 <- ts(cbind(month.dat$Casual.K, month.dat$Member.K), start = c(2010, 9), frequency = 12)
+
+# time series plot of monthly demand split by member type
+autoplot(month.ts2, ylab = "Count") +
+  ggtitle("Member v. Casual Bike Share Trips") +
+  xlab("Year") +
+  ylab("Count (Thousands)") +
+  scale_x_continuous(breaks = seq(2011, 2019)) +
+  scale_color_discrete(name = "Type", labels = c("Casual", "Member"))
+```
+
+We can immediately see that the majority of the demand is generated by members. And while there is growth in both user types, most of the growth in demand has been driven by members. We can also see that the member demand continued to grow in 2018, but casual demand actually decreased noticably in 2018.  
+
+When the time series has a seaonal pattern, it also sometimes useful to look at the data in seasonal and month plots. These graphs can be seen below.  
+
+```{r}
+# seasonal plot
+splot <- ggseasonplot(month.ts) +
+  ggtitle("Seasonal Plot: Bike Share Trips") +
+  scale_color_discrete(name = "Year")
+
+# month plot
+mplot <- ggmonthplot(month.ts) +
+  ggtitle("Month Plot: Bike Share Trips") +
+  theme(axis.title.y = element_blank())
+
+# arrange plots in one panel
+grid.arrange(splot, mplot, nrow = 2)
+
+# remove plots from memory
+rm(splot, mplot)
+```
+
+The seasonal plot shows us a separate line for each year with a data point for each month. The month plot shows us the opposite: a line for each month with a data point for each year.  
+
+These plots show us that demand usually reaches its peak sometime in June, July, or August. We can also see more clearly how demand increased rapidly at first and has since leveled off. The plots also show us that overall demand is down in 2018 in nearly every month. As I mentioned before, though, this is largely due to the decrease in casual demand.  
+
+Now that we have a better understanding of the features of the monthly time series, we can begin using this information to build forecasting models. There are numerous different types of forecasting models out there. In this report I skip over talking about the simpler models--as they are inadequate for this data--and go straight to discussing the ARIMA model.  
+
+I do not want to go into too much technical detail, but I will briefly discuss how forecasting models work, specifically the ARIMA model. In general, forecasting models are able to predict future values by picking up on historical trends and patterns. The ARIMA (autoregressive integrated moving average) model is currently the most commonly used forecasting model. It is quite robust and can handle a variety of situations. ARIMA works by first removing trend and seasonality through a process called "differencing", then the model takes advantage of relationships between past and present values to predict future values. We can also add external variables to improve our prediction; this kind of model is called an ARIMAX model. In our case, external variables might be temperature or precipitation. 
+
+Before I display the results of the models I have built, I should make note of two things. First, there are several paramters for an ARIMA model that must be manually chosen. So, behind the scenes I have fit several different models and I display the results of the best model. Second, I have not used all of the data to train the model. I initially used 2011-2017 to train, and tested on 2018. However, models built with this training data all overestimated the demand in 2018. This is because the first few years had higher rates of growth than recent years. Forecasting models do not do well when the trends and patterns in the data change over time. For that reason, it is sometimes better to train forecasting models using a subset of the data. In this case, I retrained the models using 2013-2017 data and achieved much better results. Now let us get to the results.  
+
+```{r}
+# take log of time series to handle nonconstant variance
+month.ts <- ts(month.dat$Count.K, start = c(2010, 9), frequency = 12)
+month.train <- window(month.ts, start = 2013, end = c(2017, 12))
+month.test <- window(month.ts, start = 2018)
+
+# auto arima fit
+ar.man <- Arima(month.train, order = c(2,1,0), seasonal = c(0,1,1))
+ar.man
+
+# MAPE
+forc.man <- forecast(ar.man, h=11)$mean
+# sum(abs((month.test - forc.man) / month.test)) * (100 / length(month.test))
+```
+
+For the sake of thoroughness, I have output the actual model above, but I won't discuss it here (Sean and Leah, if you are interestd in knowing more about what this output means, I can explain more when we get a chance to talk on the phone). Instead, lets go straight to examining the accuracy of the model. Below is a graph showing the actual and forecasted monthly demand in 2018.  
+
+```{r}
+# create dataframe with actual and forecasted values
+ts.forcs <-
+  data.frame(Date = as.Date(as.yearmon(time(month.test))),
+             Actual = as.matrix(month.test),
+             ARIMA = as.matrix(forc.man)) %>% 
+  gather(key = Model, value = Count, Actual, ARIMA)
+
+# create plot with all forecasts
+ggplot(data = ts.forcs, aes(x = Date, y = Count, col = Model)) +
+  geom_line() +
+  ggtitle("Actual vs Forecasted Monthly Demand in 2018") +
+  ylab("Count (Thousands)") +
+  scale_x_date(date_labels="%b",date_breaks  ="1 month") +
+  theme(panel.grid.minor.x = element_blank())
+```
+
+The graph shows that we have done quite well. There are several different metrics that are used to quantify the accuracy of forecasting models. One of the most common is mean absolute percentage error (MAPE). As with most accuracy metrics, the lower the better. In this case, we achieved a MAPE of 9.27%. This can be interpreted to mean that, on average, the forecast is off by 9.27%. Considering the amount of variability in the data, and the fact that we are forecasting a whole year into the future, this is quite good.  
+
+I have only forecasted a year into the future because I only had a year's worth of testing data to compare against. In theory, though, we can forecast out as far as we want. Below is a graph showing a two year forecast with 80% and 95% confidence internals.  
+
+```{r}
+# plot forecast
+autoplot(forecast(ar.man, h = 24), xlab = "Year", ylab = "Count (Thousands)")
+```
+
+I would like to draw attention to the fact the confidence intervals, which help to measure our uncertainty, increase the farther out the forecast goes. This will happen with any forecasting model, and the reason is fairly intuitive. The farther out in time we go, the more likely it becomes that the trend of the data will change.  
+
+As I mentioned earlier, monthly forecasts are helpful in guiding long-term strategy. In this case, our forecasts show that growth in demand is beginning to level out. This could mean several differnt things based off of what actions Capital Bikeshare has been taking. If they have been continually increasing their fleet and number of stations, it could indicate that the current market has become saturated and they need to look to new markets for continued growth. If they have not been increasing their fleet size and number of stations, then this may indicate to them that they need to increase both of these to meet demand.  
+
+When I talked to Sean on the phone, he mentioned that one of the things GOTCHA needs to get from its data is information about how to more efficiently deploy its products. For this purpose, daily and hourly forecasts would be much more useful.  
+
+### Daily Demand
+
+To start off with daily forecasting, let us look at graph of daily demand over time.
+
+```{r}
+# create daily time series
+day.ts <- ts(day.dat$Count, start = c(1,2), frequency = 7) %>% na.interp
+
+
+# time series plot of daily demand
+autoplot(day.ts, ylab = "Count") +
+  ggtitle("Hourly Bike Share Trips") +
+  xlab("Week") +
+  ylab("Count")
+```
+
+We can see from the above plot that daily demand follows the same general trend as monthly demand, but with much more variability. There is one odd feature of the time series: there is a sharp peak each year before the normal peak summer months. Lets look at this same plot split by member type to see if we can learn any more.  
+
+```{r}
+# create multivariate time series of daily demand
+day.ts2 <- ts(cbind(day.dat$Member, day.dat$Casual), start = c(1,2), frequency = 7)
+
+# time series plot of daily demand split by member type
+autoplot(day.ts2, ylab = "Count") +
+  ggtitle("Member v. Casual Bike Share Trips") +
+  xlab("Week") +
+  ylab("Count") +
+  scale_color_discrete(name = "Type", labels = c("Member", "Casual"))
+```
+
+There is a lot of overlap between the two time series, but we can see that the sharp peak is being caused by casual user demand. This indicates to us that this sharp peak is probably being caused by tourist activity. After some more sleuthing, I figured out that the peak comes around mid-March every year, which lines up with both the National Cherry Blossom Festival and Easter. So, in addition to accounting for variables like temperature and precipitation, our models for daily demand should also try to incorporate information about holidays and events.  
+
+Before we proceed to modeling, however, let us look at some more graphs to find any other patterns in the data. In addition to the annual seasonality we had for the monthly dataset, we likely have an added layer of weekly seasonality.  
+
+```{r}
+# boxplot by day of week and member type
+day.dat %>% 
+  filter(year(Date) %in% c(2015, 2016, 2017, 2018)) %>%
+  mutate(Week.Day = wday(Date, label = T)) %>% 
+  select(Week.Day, Casual, Member) %>% 
+  gather(key = Type, value = Count, Casual:Member) %>% 
+  ggplot(aes(x = Week.Day, y = Count, col = Type)) +
+  geom_boxplot() +
+  ggtitle("Casual vs Member Demand by Day of Week") +
+  xlab("Day of Week")
+```
+
+From the side-by-side boxplots, shown above, we can see that there is indeed an added layer of weekly seasonality. Although, the weekly pattern differs between casual users and members. The members are most likely DC residents that use the bike share to commute to work every day; they have higher demand on work days compared to weekends. On the other hand, casual user demand is higher on the weekends.  
+
+When we have two groups with distinct patterns like this, it is often more accurate to model the groups with entirely separate forecasting models. For the sake of finishing this report in a timely manner, however, I have decided to forgo a separate model approach. And as you are about to see, I am still able to achieve accurate predictions even when modeling casual user and member demand together.  
+
+As I have previously mentioned, there is a large amount of day-to-day variability in this data. I believe that much of this variability can be captured by weather data. So, I have gone ahead and obtained daily temperature and precipitation data from Weather Underground. Below are scatterplots comparing temperature and precipitation against daily demand. 
+
+```{r}
+# merge weatehr and daily demand datasets
+merged.dat <- merge(x = day.dat, y = temp.dat, by = "Date", all.y = TRUE) %>% 
+  mutate(Avg2 = Avg^2, Avg3 = Avg^3)
+# remove missing values
+merged.dat <- merged.dat[-which(is.na(merged.dat$Count)), ]
+
+# fit model for temperature and get fitted values
+temp.mod <- lm(Count ~ Avg + Avg2 + Avg3, data = merged.dat)
+temp.fit <- predict.lm(temp.mod, data.frame(Avg = 15:95, Avg2 = (15:95)^2, Avg3 = (15:95)^3))
+
+# plot temp vs demand with model overlaid
+temp.plot <- merged.dat %>% 
+  ggplot(aes(x = Avg, y = Count)) +
+  geom_point() +
+  geom_line(data = data.frame(Pred = temp.fit, Temp = 15:95),
+            aes(x = Temp, y = Pred), col = "blue", lwd = 1) +
+  xlab("Average Temperature (F)")
+
+# plot precip vs demand with model overlaid
+prec.plot <- merged.dat %>% 
+  ggplot(aes(x = Precip, y = Count)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, col = "blue", lwd = 1) +
+  xlab("Precipitation (Inches)")
+
+# arrange in one grid
+grid.arrange(temp.plot, prec.plot, nrow = 1, top = "Effect of Temperature and Precipitation on Daily Demand")
+```
+
+We can see there is a clear relationship between temperature and demand. The correlation between the two variables is 0.77. This tells us the relationship is moderately strong and positive; that is, as temperature increases, demand increases. However, correlation only measures the strength of linear relationships and this data appears to have a quadratic or cubic relationship, so the relationship may be even stronger than the correlation metric indicates. What I mean by a quadratic relationship is that overall demand increases as temperature increases, but demand does appear to begin decreasing slightly as we reach extreme temperatures in the high 80s and 90s.  
+
+Precipitation is not as strongly correlated with demand with a correlation of -0.25. The relationship is not as strong, but that does not mean that precipitation can not be useful when trying to forecast daily demand.  
+
+In the above graphs, I displayed the daily demands relationships to temperature and precipitation separately, but we can create one regression model with all of the variables in it. The output for such a model is shown below.  
+
+```{r}
+weather.mod <- lm(Count ~ Avg + Avg2 + Avg3 + Precip, data = merged.dat)
+summary(weather.mod)
+```
+
+The only thing I would like to draw your attention to here is adjusted $R^2$ value at the bottom of the output. This model has an adjusted $R^2$ of 0.7457. This can be interpreted to mean that temperature and precipitation can jointly explain 74.57% of the variation in the daily demand. We will have to keep this in mind when building our forecasting models. 
+
+We will start off building an ARIMA model to see how well we can do without weather data. And if necessary, we will build an ARIMAX model that does include weather data.  
+
+I have gone ahead and fit an ARIMA model by training on data from 2016 and 2017. Below is a graph displaying the models predictions against the actual values for the first two months of 2018.  
+
+```{r}
+# training and testing data
+day.train <- window(day.ts, start = c(276,6), end = c(381,1)) #2016,2017
+# day.test <- window(day.ts, start = c(381,2), end = c(393,7))  #2018 Q1
+day.test <- window(day.ts, start = c(381,2), end = c(389,4))  #2018 M1
+
+# build arima with manual parameter selection
+ar.man1 <- Arima(day.train, order = c(1,0,1), seasonal = c(0,1,1))
+
+# create dataframe with test values and forecasts
+day.forcs <- 
+  data.frame(Date = seq.Date(as.Date("2018-01-01"), as.Date("2018-02-28"), "days"),
+             Actual = as.matrix(day.test),
+             ARIMA = as.matrix(forecast(ar.man1, h = 59)$mean)) %>% 
+  gather(key = Model, value = Count, Actual:ARIMA)
+
+# create plot with all forecasts
+ggplot(data = day.forcs, aes(x = Date, y = Count, col = Model)) +
+  geom_line()
+
+# calculate accuracy metrics
+# sum(abs(forecast(ar.man1, h = 90)$mean - day.test)) / sum(day.test) # MAPE
+```
+
+We can see that the model was able to pick up the overall trend and weekly seasonality, but it does a very poor job at capturing the day-to-day variation caused by weather. The MAPE of this model is 27.8%. Let us see how much better we can do by adding weather variables to our model.  
+
+```{r}
+# subset temperature data
+temp.1617 <- with(temp.dat %>% filter(year(Date) %in% c(2016,2017)), cbind(Avg, Precip))
+temp.18Q1 <- with(temp.dat %>% filter(year(Date) == 2018, month(Date) %in% 1:2), cbind(Avg, Precip))
+
+# build arimax with manual parameter selection
+ar.manX <- Arima(day.train, order = c(1,0,1), seasonal = c(0,1,1), xreg = temp.1617)
+
+# create dataframe with test values and forecasts
+day.forcs <- 
+  data.frame(Date = seq.Date(as.Date("2018-01-01"), as.Date("2018-02-28"), "days"),
+             Actual = as.matrix(day.test),
+             ARIMAX = as.matrix(forecast(ar.manX, h = 59, xreg = temp.18Q1)$mean)) %>% 
+  gather(key = Model, value = Count, Actual:ARIMAX)
+
+# create plot with all forecasts
+ggplot(data = day.forcs, aes(x = Date, y = Count, col = Model)) +
+  geom_line()
+
+# calculate accuracy metrics
+# sum(abs(forecast(ar.manX, h = 59, xreg = temp.18Q1)$mean - day.test)) / sum(day.test) # MAPE
+```
+
+As we can see from the line graphs, the ARIMAX model that includes weather data does a much better job at capturing the day-to-day variability in demand. The ARIMAX model achieved a MAPE of 17.0%, compared to 27.8% for the ARIMA model. I should note that in these models I have forecasted using exact temperature and precipitation data. When forecasting in real life, we would not already know the exact weather conditions on a given day in the future. That being said, we can easily adapt this approach to use weather forecasts rather than exact weather data.  
+
+I also mentioned earlier that holidays and events can also significantly impact daily demand. In these models I have not incorporated vairables related to events since I was unable to easily find such a dataset, but if we were using these models to make real life business decisions it would be well worth the time to find and incorporate event and holiday data.  
+
+### Hourly Forecasting
+
+For the sake of time I have not built any hourly demand forecasating models, but I will briefly discuss how I would go about doing it. For the most part, it would be very similar to how we modeled daily data. However, there would now be a third layer of seasonality: annual, weekly, and daily. Given that any hourly forecasts would be done on a very short time horizon (a couple of days at most), we would likely be able to ignore annual seasonality. Daily seasonality and weather data would likely be the most important features of the model, so let us look at how demand changes from hour to hour.  
+
+```{r}
+# boxplot by day of week and member type
+hour.dat %>% 
+  filter(year(Date) %in% c(2016, 2017, 2018)) %>%
+  mutate(Hour = as.factor(hour(Date))) %>% 
+  select(Hour, Member, Casual) %>% 
+  gather(key = Type, value = Count, Casual:Member) %>% 
+  ggplot(aes(x = Hour, y = Count, col = Type)) +
+  facet_wrap( ~ Type, nrow = 2) +
+  geom_boxplot() +
+  ggtitle("Member vs Casual Demand by Hour") +
+  scale_color_discrete(guide = FALSE)
+```
+
+We can immediately see that members and casual users once again have different patterns, so it would be worth modeling them with separate models. For the members, we can see that there are two peaks in the morning and evening. These peaks likely represent morning and evening rush hour demand. The casual user demand is relatively stable throughout the day with a slight peak around midday. These two patterns reinforce our belief that members are mostly residents who use the bikeshare for commuting and the casual users are tourists who use the bikeshare to ride around the city.
+
+I would like to briefly talk about what might be different between the forecasting models I have built here and forecasting models for GOTCHA data. Capital Bikeshare operates one bikeshare in a very large, connected ecosystem; whereas, GOTCHA operates across a variety of campuses and towns. There are two possible approaches to modeling data across several locations. The quick and easy approach would be to model the aggregate demand across all locations, then use historical proportions to determine what demand in each location likely is. The more involved, but more accurate, approach would be to build seperate models for each location. The second approach is definitely the better approach as different campuses would have very different school schedules, events, and weather on any given day.  
+
+## Fleet and Station Management
+
+### Bikes
+
+Let us quickly see how Capital Bikeshare has expanded and managed their fleet of bikes over time. Below is a graph of the fleet size.  
+
+```{r}
+# first and last appearance of bikes
+bike.lifecyl <- trip.dat %>%
+  group_by(Bike.Number) %>%
+  summarise(bike.first = min(Start.Date), bike.last = max(Start.Date)) %>% ungroup %>% 
+  mutate(bike.first = as.POSIXct(paste(year(bike.first), month(bike.first), "01", sep = "-"),
+                                 format = "%Y-%m-%d"),
+         bike.last = as.POSIXct(paste(year(bike.last), month(bike.last), "01", sep = "-"),
+                                 format = "%Y-%m-%d"))
+bike.lifecyl <- bike.lifecyl[-(1:27), ]
+
+# count of bike gains by month
+bike.gain <- bike.lifecyl %>% 
+  mutate(Year = year(bike.first), Month = month(bike.first)) %>% 
+  group_by(Year, Month) %>% 
+  summarise(gains = n()) %>% ungroup %>% 
+  mutate(totgains = cumsum(gains),
+         Date = as.POSIXct(paste(Year, Month, "1", sep = "-"), format = "%Y-%m-%d")) %>% 
+  select(Date, gains, totgains)
+# count of bike losses by month
+bike.loss <- bike.lifecyl %>% 
+  mutate(Year = year(bike.last), Month = month(bike.last)) %>% 
+  group_by(Year, Month) %>% 
+  summarise(losses = n()) %>% ungroup %>% 
+  mutate(totlosses = cumsum(losses),
+         Date = as.POSIXct(paste(Year, Month, "1", sep = "-"), format = "%Y-%m-%d")) %>% 
+  select(Date, losses, totlosses)
+# count of bikes by month
+bike.count <- merge(x = bike.gain, y = bike.loss, by = "Date", all = TRUE) %>% 
+  replace(is.na(.), 0) %>% 
+  mutate(netgains = gains - losses,
+         count = cumsum(netgains)) %>% 
+  filter(Date <= as.POSIXct("2018-01-01"))
+
+ggplot(bike.count, aes(x = Date, y = count)) +
+  geom_line() +
+  ggtitle("Fleet Size Over Time") + ylab("Bikes")
+```
+
+As of the beginning of 2018, Capital Bikeshare had added 4818 bikes to its fleet. Over the same time period, 285 of those bikes were removed from service, leaving the fleet size at 4533. Before we move on, let us quickly look at some numerical summaries for the distribution of bike lifespans and compare between active and retired bikes.  
+
+```{r}
+bike.lifecyl <- bike.lifecyl %>% 
+  mutate(Days = as.numeric(difftime(bike.last, bike.first, units = "days")),
+         Retired = bike.last <= as.POSIXct("2018-01-01")) %>% 
+  filter(bike.first <= as.POSIXct("2018-01-01"),
+         Days != 0)
+
+# bike.lifecyl %>% 
+#   filter(Retired == 1) %>% 
+#   select(Days) %>% 
+#   summary %>%
+#   knitr::kable(caption = "Distribution of Lifespan of Retired Bikes")
+# 
+# bike.lifecyl %>% 
+#   filter(Retired == 0) %>% 
+#   select(Days) %>% 
+#   summary %>% 
+#   knitr::kable(caption = "Distribution of Lifespan of Active Bikes")
+
+data.frame(Min = c(28, 243), Q1 = c(556.2, 1126), Med = c(1218, 1979), Q3 = c(1796.8, 2557), Max = c(2649, 3013), Mean = c(1248, 1879),
+           row.names = c("Retired", "Active")) %>% 
+  knitr::kable(caption = "Active vs Retired Distribution of Bike Lifespan in Days")
+```
+
+From the above table, we can see that retired bikes have a median and mean lifespan of 1218 and 1248 days, respectively. Active bikes have a median and mean lifespan of 1979 and 1879 days, respectively. Unfortunately, without more information I am not able to say why any given bike was removed from the fleet.  
+
+I should also note that my estimates of fleet size may be slightly off at different time periods. To determine when a bike entered and left the fleet, I simply looked for the first and last date each bike appeared in the dataset I have. So, it is possible that a bike may have been sitting idle for some time before or after being added or removed from the fleet. This would only bias my estimates slightly, and overall these figure should be roughyl accurate.  
+
+### Stations
+
+We may also be interested in tracking the number of stations over time. We can use the station and date variables to identify the first time each station is used. Then we can group by year and month to get the number of new stations each month. Below is a graph of the number of Capital Bikeshare stations over time.
+
+```{r}
+# first appearance of stations
+station.start <- trip.dat %>% group_by(Start.Station) %>% summarise(first.start = min(Start.Date))
+station.end <- trip.dat %>% group_by(End.Station) %>% summarise(first.end = min(End.Date))
+station.date <- cbind(station.start, station.end) %>% 
+  mutate(first.date = ifelse(first.start < first.end,
+                             yes = as.character(first.start),
+                             no = as.character(first.end)) %>% as.POSIXct()) %>% 
+  select(Station = Start.Station, Date = first.date) %>% 
+  arrange(Date)
+# merge first appearance with city data
+stat.dat <- merge(x = read.csv("stations.csv"), y = station.date, by = "Station")
+# remove intermediate dataframe
+rm(station.start, station.end, station.date)
+
+# count of stations by month
+stat.count <- stat.dat %>% 
+  mutate(Year = year(Date), Month = month(Date)) %>% 
+  group_by(Year, Month) %>% 
+  summarise(count = n()) %>% ungroup %>% 
+  mutate(totcount = cumsum(count),
+         Date = as.POSIXct(paste(Year, Month, "1", sep = "-"), format = "%Y-%m-%d")) %>% 
+  select(Date, Tot.Count = totcount)
+
+ggplot(stat.count, aes(x = Date, y = Tot.Count)) +
+  geom_line() +
+  ggtitle("Number of Stations Over Time") +
+  ylab("Stations")
+```
+
+From the graph we can see that the number of stations added over time roughly matches the growth is ride demand over time. Although, I should note that while earlier graphs seemed to show that growth in demand was slowing, the growth in the number of stations has remained relatively constant. This may indicate that there is a decreasing return from adding new stations after a certain point. That is not to say that it is not worthwhile to continue adding stations. It may be increasing at a lower rate, but demand for the bikes is still growing.
+
+All of what I have just said does not consider the fact that Capital Bikeshare operates throughout the entire DC Metropolitan area, not just the city itself. So, it is possible that the city has already been saturated with stations and bikes, but there may still be room to grow in the Virginia and Maryland suburbs. Let us view the number of stations over time by area.  
+
+```{r}
+# count of stations by month
+stat.count <- stat.dat %>% 
+  mutate(Year = year(Date), Month = month(Date)) %>% 
+  group_by(Area, Year, Month) %>% 
+  summarise(Count = n()) %>% ungroup %>% 
+  mutate(Date = as.POSIXct(paste(Year, Month, "1", sep = "-"), format = "%Y-%m-%d")) %>% 
+  select(Date, Area, Count)
+
+stat.count.area <-
+  data.frame(Date = seq.POSIXt(as.POSIXct("2010-09-01"), as.POSIXct("2018-12-01"), "months")) %>% 
+  merge(filter(stat.count, Area == "Washington, DC"), by = "Date", all.x = TRUE) %>% 
+  select(Date, DC = Count) %>% 
+  merge(filter(stat.count, Area == "Arlington"), by = "Date", all.x = TRUE) %>% 
+  select(Date, DC, Arlington = Count) %>% 
+  merge(filter(stat.count, Area == "Alexandria"), by = "Date", all.x = TRUE) %>%
+  select(Date, DC, Arlington, Alexandria = Count) %>% 
+  merge(filter(stat.count, Area == "Fairfax County"), by = "Date", all.x = TRUE) %>%
+  select(Date, DC, Arlington, Alexandria, Fairfax = Count) %>% 
+  merge(filter(stat.count, Area == "Montgomery County"), by = "Date", all.x = TRUE) %>%
+  select(Date, DC, Arlington, Alexandria, Fairfax, Montgomery = Count) %>% 
+  merge(filter(stat.count, Area == "Prince George's County"), by = "Date", all.x = TRUE) %>%
+  select(Date, DC, Arlington, Alexandria, Fairfax, Montgomery, PG = Count) %>% 
+  merge(filter(stat.count, Area == "Takoma Park"), by = "Date", all.x = TRUE) %>%
+  select(Date, DC, Arlington, Alexandria, Fairfax, Montgomery, PG, TKP = Count) %>% 
+  replace(., is.na(.), 0) %>% 
+  mutate(DC = cumsum(DC), Arlington = cumsum(Arlington), Alexandria = cumsum(Alexandria),
+         Fairfax = cumsum(Fairfax), Montgomery = cumsum(Montgomery), PG = cumsum(PG),
+         TKP = cumsum(TKP)) %>% 
+  gather(key = Area, value = Stations, DC:TKP)
+
+ggplot(stat.count.area, aes(x = Date, y = Stations, col = Area)) +
+  geom_line() +
+  ggtitle("Numbers of Stations by Area") +
+  scale_color_discrete(breaks = c("Alexandria", "Arlington", "DC", "Fairfax", "Montgomery", "PG", "TKP"),
+                       labels = c("Alexandria", "Arlington", "DC", "Fairfax", "Montgomery", "Prince George's", "Takoma Park"))
+```
+
+From this graph, we can see that Capital Bikeshare has been steadily expanding its presence in DC and Arlington County (Virginia) since it first launched. In mid-2012, they expanded to Alexandria and have added only a handful of stations there over time. From my own knowledge of the area, this makes sense as Alexandria is only a small township, not a large county nor city. In mid-2013, they rapidly expanded into Montgomery County (Maryland) and have slowly expanded their presence there ever since. Over time, they have expanded into several other areas in Virginia and Maryland. In particular, they have moved into Fairfax County (Tysons, VA; Reston, VA). Both Tysons and Reston are well established areas, but they have been growing quickly in recent years and may be a great opportunity for Capital Bikeshare to expand their user base.  
+
+We now have an idea of what regions the bikeshare operates in, but we have not yet explored what areas have the highest traffic and what direction traffic is moving in throughout the day. Before we move on, though, let's first just take a quick look at a map of station locations so we can better understand where Capital Bikeshare has a presence.  
+
+The dataset I have only listed the street address of each station. To plot points on a map, however, we will need lat-lon coordinates. This shouldn't be a problem, though. All we need is a Google API key, then we can use the `ggmap` package to obtain coordinates. 
+
+```{r}
+# register google API key; only has to be done once per session
+register_google(key = "AIzaSyAZvPFcyv_zQMKOMQFNhvst5_88CfH6q-U")
+
+# # store unique addresses of bike stations in dataframe
+# addresses <- stat.dat %>%
+#   # split strings with multiple addresses
+#   mutate(split1 = sapply(str_split(Station, "/"), function(x) x[1]),
+#          split2 = sapply(str_split(Station, "/"), function(x) x[2]),
+#          Address = ifelse(str_detect(split1, "&"),
+#                           yes = split1,
+#                           no = ifelse(str_detect(split2, "&"),
+#                                       yes = split2,
+#                                       no = split1)),
+#          Address = paste(Address, ", ", City, sep = ""))
+# 
+# # get latitude and longitude of stations
+# latlon <- geocode(addresses$Address, output = "latlon", source = "google")
+# addresses <- addresses %>%
+#   mutate(Latitude = latlon$lat, Longitude = latlon$lon) %>%
+#   select(Station, Address, City, Area, Latitude, Longitude)
+# 
+# write.csv(addresses, "addresses.csv", row.names = FALSE)
+
+addresses <- read.csv("addresses.csv") %>% 
+  filter(Area != "Chevy Chase") %>% 
+  mutate(Area = factor(Area))
+
+map <- get_googlemap(center = c(lon = -77.03687, lat = 38.90719), zoom = 10, maptype = "terrain",
+                     style=c(feature="all",element="labels",visibility="off"))
+ggmap(map) +
+  geom_point(aes(x = Longitude, y = Latitude, col = Area), size = 0.5, data = addresses) +
+  ggtitle("Capital Bikeshare Station Locations") +
+  scale_x_continuous(limits = c(-77.40,-76.80), expand = c(0,0)) +
+  scale_y_continuous(limits = c(38.77, 39.15), expand = c(0,0)) +
+  theme(axis.title = element_blank(), axis.text = element_blank(),
+        axis.ticks = element_blank())
+```
+
+From this map we can get a better idea of how traffic might move around between areas. Tysons and Reston (Fairfax County) likely do not have trips traveling outside of those areas due to the great distance. However, there is probably a good amount of cross traffic between DC and the nearby suburbs of Arlington and southern Montgomery County. In the next section, we will try to quantify and validate the hypotheses that I have just put forth by examing popular areas and the interactions between different areas.  
+
+## Popular Areas and Routes
+
+First let us look at the stations that are most used in terms of both pickups and dropoffs.  Below are datasets for the ten most popular starting stations and ending stations.  
+
+```{r}
+# get daily demand of rentals
+start.dat <- trip.dat %>%
+  mutate(Year = year(Start.Date), Month = month(Start.Date), Day = day(Start.Date)) %>% 
+  group_by(Start.Station, Year, Month, Day) %>% 
+  summarise(Count = n()) %>% ungroup %>% 
+  group_by(Start.Station) %>% 
+  summarise(Med.Count = median(Count), Mean.Count = mean(Count)) %>% 
+  arrange(-Med.Count)
+
+end.dat <- trip.dat %>%
+  mutate(Year = year(Start.Date), Month = month(Start.Date), Day = day(Start.Date)) %>% 
+  group_by(End.Station, Year, Month, Day) %>% 
+  summarise(Count = n()) %>% ungroup %>% 
+  group_by(End.Station) %>% 
+  summarise(Med.Count = median(Count), Mean.Count = mean(Count)) %>% 
+  arrange(-Med.Count)
+
+head(start.dat, n = 10) %>% knitr::kable(caption = "Ten Most Popular Starting Stations")
+head(end.dat, n = 10) %>% knitr::kable(caption = "Ten Most Popular Ending Stations")
+```
+
+Unsurprisingly, all of the most popular stations are in DC. While knowing which stations are popular can help inform us about how big a bike rack we need at each station, when considering how to efficiently deploy the fleet it may be more useful to consider net number of rides per station. That is, we want to figure out which stations have more bikes leaving than arriving and vice versa.  
+
+```{r}
+start.dat <- trip.dat %>%
+  mutate(Year = year(Start.Date), Month = month(Start.Date), Day = day(Start.Date)) %>% 
+  filter(Year == 2018) %>% 
+  group_by(Start.Station, Year, Month, Day) %>% 
+  summarise(Count = n()) %>% ungroup %>% 
+  rename(Station = Start.Station, Start.Count = Count)
+
+end.dat <- trip.dat %>%
+  mutate(Year = year(Start.Date), Month = month(Start.Date), Day = day(Start.Date)) %>% 
+  filter(Year == 2018) %>% 
+  group_by(End.Station, Year, Month, Day) %>% 
+  summarise(Count = n()) %>% ungroup %>% 
+  rename(Station = End.Station, End.Count = Count)
+
+trans.dat <- merge(x = start.dat, y = end.dat, by = c("Station", "Year", "Month", "Day"), all = TRUE) %>% 
+  replace(., is.na(.), 0) %>% 
+  mutate(Net.Trips = Start.Count - End.Count) %>% 
+  group_by(Station) %>% 
+  summarise(Mean.Net.Trips = mean(Net.Trips))
+
+trans.dat %>% filter(Mean.Net.Trips > 0) %>% arrange(-Mean.Net.Trips) %>%
+  head(n = 10) %>% knitr::kable(caption = "Stations with Highest Positive Net Trips")
+trans.dat %>% filter(Mean.Net.Trips < 0) %>% arrange(Mean.Net.Trips) %>%
+  head(n = 10) %>% knitr::kable(caption = "Stations with Lowest Negative Net Trips")
+```
+
+The above tables show us the ten stations with the highest postive net trips and the ten stations with the lowest negative net trips. A postive number of net trips indicates that there are more trips beginning than ending at the station. This means Capital Bikeshare would need employees to bring bikes to these stations in order to meet demand. Inversely, stations with negative net trips would have bikes piling up at the station and employees would need to move bikes away from these stations. We could combine this information to match net positive and net negative stations that are nearby each other so that employees can redistribute bikes in the most efficient way possible.  
+
+So far we have looked at metrics for individual stations. When we looked at the map of all stations, I briefly hypothesized about how traffic might move between the major areas where Capital Bikeshare has a presence. Let us try to visualize and quantify traffic patterns between these areas. For now we will focus on DC, Arlington, and Alexandria.  
+
+```{r}
+morn.dat <- trip.dat %>% 
+  filter(year(Start.Date) == 2018, hour(Start.Date) %in% 6:9, Member.Type == "Member") %>% 
+  select(Start.Station, End.Station) %>% 
+  merge(addresses[,c(1,4)], by.x = "Start.Station", by.y = "Station") %>% 
+  rename(Start.Area = Area) %>% 
+  merge(addresses[,c(1,4)], by.x = "End.Station", by.y = "Station") %>% 
+  rename(End.Area = Area) %>% 
+  filter(Start.Area %in% c("Alexandria", "Arlington", "Washington, DC")) %>% 
+  mutate(End.Area = as.character(End.Area),
+         End.Area = ifelse(End.Area %in% c("Alexandria", "Arlington", "Washington, DC"), yes = End.Area, no = "Other"),
+         End.Area = as.factor(End.Area)) %>% 
+  group_by(Start.Area, End.Area) %>% 
+  summarise(Count = n()) %>% ungroup %>% 
+  mutate(Percent = round(100 * Count / sum(Count), digits = 2))
+
+even.dat <- trip.dat %>% 
+  filter(year(Start.Date) == 2018, hour(Start.Date) %in% 16:19, Member.Type == "Member") %>% 
+  select(Start.Station, End.Station) %>% 
+  merge(addresses[,c(1,4)], by.x = "Start.Station", by.y = "Station") %>% 
+  rename(Start.Area = Area) %>% 
+  merge(addresses[,c(1,4)], by.x = "End.Station", by.y = "Station") %>% 
+  rename(End.Area = Area) %>% 
+  filter(Start.Area %in% c("Alexandria", "Arlington", "Washington, DC")) %>% 
+  mutate(End.Area = as.character(End.Area),
+         End.Area = ifelse(End.Area %in% c("Alexandria", "Arlington", "Washington, DC"), yes = End.Area, no = "Other"),
+         End.Area = as.factor(End.Area)) %>% 
+  group_by(Start.Area, End.Area) %>% 
+  summarise(Count = n()) %>% ungroup %>% 
+  mutate(Percent = round(100 * Count / sum(Count), digits = 2))
+
+knitr::kable(morn.dat, caption = "Morning Rush Hour Movement Patterns")
+knitr::kable(even.dat, caption = "Evening Rush Hour Movement Patterns")
+```
+
+
+```{r}
+# area.dat <- data.frame(Area = c("DC","Arlington","Alexandria"),
+#                        Longitude = c(-77.03687,-77.09098,-77.04692),
+#                        Latitude = c(38.90719,38.88162,38.80484),
+#                        Proportion = c(0.8835,0.0900,0.0265)) %>% 
+#   mutate(Area = factor(Area))
+# 
+# arrow.dat <- data.frame(Start.Area = c(rep("Alexandria", times = 3), rep("Arlington", times = 3), rep("DC", times = 3)),
+#                         End.Area = rep(c("Alexandria", "Arlington", "DC"), times = 3),
+#                         Lon = c(-77.04692,-77.04692,-77.04692,
+#                                 -77.09098,-77.03687),
+#                         Lat = rep(c(38.80484,38.88162,38.90719), each = 3),
+#                         Lon.End = rep(c(-77.04692,-77.09098,-77.03687), times = 3),
+#                         Lat.End = rep(c(38.80484,38.88162,38.90719), times = 3)) %>% 
+#   mutate(Start.Area = factor(Start.Area))
+# 
+# map <- get_googlemap(center = c(lon = -77.03687, lat = 38.90719), zoom = 11, maptype = "terrain",
+#                      style=c(feature="all",element="labels",visibility="off"))
+# 
+# ggmap(map) +
+#   geom_point(aes(x = Longitude, y = Latitude, col = Area, size = Proportion), data = area.dat) +
+#   geom_segment(aes(x = Lon, xend = Lon.End, y = Lat, yend = Lat.End, col = Start.Area), data = arrow.dat) +
+#   ggtitle("") +
+#   scale_x_continuous(limits = c(-77.14,-76.91), expand = c(0,0)) +
+#   scale_y_continuous(limits = c(38.785, 38.97), expand = c(0,0)) +
+#   scale_size_continuous(range = c(5,25), guide = FALSE) +
+#   theme(axis.title = element_blank(), axis.text = element_blank(),
+#         axis.ticks = element_blank())
+```
